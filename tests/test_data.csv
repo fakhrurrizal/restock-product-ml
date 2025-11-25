@@ -1,0 +1,6 @@
+No. Pesanan,Status Pesanan,Waktu Pesanan Dibuat,Nama Produk,SKU Induk,Jumlah,Harga Setelah Diskon,Total Pembayaran
+ORDER001,selesai,2024-01-01,Produk A,SKU001,5,10000,50000
+ORDER002,selesai,2024-01-01,Produk B,SKU002,3,15000,45000
+ORDER003,selesai,2024-01-02,Produk A,SKU001,2,10000,20000
+ORDER004,selesai,2024-01-02,Produk C,SKU003,7,8000,56000
+ORDER005,selesai,2024-01-03,Produk B,SKU002,4,15000,60000
