@@ -37,6 +37,304 @@ class AutoMagicPredictor:
             self.auto_setup(dataset_path)
         else:
             self.auto_setup()
+            
+    def process_natural_language(self, prompt):
+        """Process natural language prompts dengan pattern matching yang lebih spesifik"""
+        prompt_lower = prompt.lower().strip()
+        
+        print(f"Memahami: '{prompt}'")
+        
+        # Pattern matching untuk berbagai jenis pertanyaan
+        patterns = {
+            'restock_urgent': [
+                'restock urgent', 'stok urgent', 'butuh restock segera', 'stok hampir habis',
+                'produk yang harus direstock', 'yang harus dibeli lagi', 'stok menipis',
+                'urgent', 'segera', 'cepat', 'prioritas', 'stok paling dikit', 'stok terkecil',
+                'stok sedikit', 'hampir habis', 'nyaris habis'
+            ],
+            'restock_all': [
+                'restock', 'stok', 'butuh restock', 'perlu restock', 'analisis restock',
+                'semua restock', 'semua stok', 'semua produk restock'
+            ],
+            'top_products': [
+                'produk terlaris', 'top produk', 'best seller', 'penjualan tertinggi',
+                'produk paling laris', 'terlaris', 'laku', 'best seller'
+            ],
+            'top_revenue': [
+                'pendapatan tertinggi', 'revenue tertinggi', 'penghasilan tertinggi',
+                'produk revenue', 'uang terbanyak', 'profit tertinggi'
+            ],
+            'prediction': [
+                'prediksi', 'ramalan', 'forecast', 'perkiraan', 'prediksi penjualan',
+                'ramalan penjualan', 'perkiraan kedepan', 'berapa hari kedepan',
+                'prediksi demand', 'perkiraan permintaan'
+            ],
+            'trend': [
+                'tren', 'trend', 'analisis tren', 'perkembangan penjualan',
+                'penjualan naik turun', 'grafik penjualan', 'kecenderungan'
+            ],
+            'summary': [
+                'semua', 'ringkasan', 'summary', 'overview', 'laporan lengkap',
+                'analisis lengkap', 'semua analisis', 'dashboard'
+            ],
+            'help': [
+                'bantuan', 'help', 'menu', 'perintah', 'cara pakai', 'fitur',
+                'bisa apa', 'tanya apa', 'command'
+            ],
+            'stock_most': [
+                'stok paling banyak', 'stok terbanyak', 'stok besar', 'stok tinggi',
+                'stok melimpah', 'stok berlebih'
+            ],
+            'stock_least': [
+                'stok paling dikit', 'stok paling sedikit', 'stok terkecil', 'stok rendah',
+                'stok kecil', 'stok minim'
+            ]
+        }
+        
+        # Cek pattern mana yang match
+        matched_patterns = []
+        for pattern_type, keywords in patterns.items():
+            for keyword in keywords:
+                if keyword in prompt_lower:
+                    matched_patterns.append(pattern_type)
+                    break
+        
+        # Handle berdasarkan pattern yang match
+        if not matched_patterns:
+            return self.handle_unknown_prompt(prompt)
+        
+        # Ambil pattern dengan priority
+        priority_order = ['stock_least', 'stock_most', 'restock_urgent', 'restock_all', 'prediction', 'top_products', 'trend', 'summary', 'help']
+        for pattern in priority_order:
+            if pattern in matched_patterns:
+                return self.execute_command(pattern, prompt)
+        
+        return self.execute_command(matched_patterns[0], prompt)
+    
+    def analyze_stock_most(self):
+        if not self.is_ready:
+            return "System not ready. Please wait..."
+        
+        restock_needs = self.predictor.analyze_product_restock_needs(self.daily_sales_data)
+        
+        if not restock_needs:
+            return "Tidak ada data stok untuk dianalisis"
+        
+        sorted_products = sorted(restock_needs, key=lambda x: x['current_stock'], reverse=True)
+        
+        response = "PRODUK DENGAN STOK PALING BANYAK\n\n"
+        
+        for i, product in enumerate(sorted_products[:10], 1):  
+            response += f"{i}. {product['product_name'][:50]}...\n"
+            response += f"   Stok: {product['current_stock']:.0f} unit\n"
+            response += f"   Penjualan/hari: {product['avg_daily_sales']:.1f} unit\n"
+            response += f"   Stok cukup untuk: {product['stock_cover_days']:.1f} hari\n"
+            response += f"   SKU: {product['sku']}\n\n"
+        
+        # Summary
+        total_stock = sum(p['current_stock'] for p in sorted_products[:10])
+        avg_cover_days = sum(p['stock_cover_days'] for p in sorted_products[:10]) / len(sorted_products[:10])
+        
+        response += f"SUMMARY:\n"
+        response += f"   Total stok 10 produk: {total_stock:.0f} unit\n"
+        response += f"   Rata-rata cover days: {avg_cover_days:.1f} hari\n"
+        response += f"   Produk dengan stok terbanyak: {sorted_products[0]['product_name'][:30]}... ({sorted_products[0]['current_stock']:.0f} unit)\n"
+        
+        return response
+
+    def analyze_stock_least(self):
+        """Analisis produk dengan stok paling sedikit"""
+        if not self.is_ready:
+            return "System not ready. Please wait..."
+        
+        restock_needs = self.predictor.analyze_product_restock_needs(self.daily_sales_data)
+        
+        if not restock_needs:
+            return "Tidak ada data stok untuk dianalisis"
+        
+        low_stock_threshold = 20  
+        low_stock_products = [p for p in restock_needs if p['current_stock'] <= low_stock_threshold]
+        
+        if not low_stock_products:
+            low_stock_products = sorted(restock_needs, key=lambda x: x['current_stock'])[:10]  
+        
+        sorted_products = sorted(low_stock_products, key=lambda x: x['current_stock'])
+        
+        response = "PRODUK DENGAN STOK PALING SEDIKIT\n\n"
+        
+        for i, product in enumerate(sorted_products[:10], 1):  # Top 10 saja
+            response += f"{i}. {product['product_name'][:50]}...\n"
+            response += f"   Stok: {product['current_stock']:.0f} unit\n"
+            response += f"   Butuh restock: {product['restock_quantity']:.0f} unit\n"
+            response += f"   Stok habis dalam: {product['stock_cover_days']:.1f} hari\n"
+            response += f"   Penjualan/hari: {product['avg_daily_sales']:.1f} unit\n"
+            response += f"   SKU: {product['sku']}\n\n"
+        
+        # Summary
+        critical_products = [p for p in sorted_products if p['stock_cover_days'] < 5]
+        
+        response += f"SUMMARY:\n"
+        response += f"   Total produk stok rendah: {len(sorted_products)} produk\n"
+        response += f"   Produk kritis (stok < 5 hari): {len(critical_products)} produk\n"
+        response += f"   Produk dengan stok tersedikit: {sorted_products[0]['product_name'][:30]}... ({sorted_products[0]['current_stock']:.0f} unit)\n"
+        
+        if critical_products:
+            response += f"\nPERINGATAN:\n"
+            response += f"   {len(critical_products)} produk akan habis dalam 5 hari!\n"
+            response += f"   Prioritaskan: {critical_products[0]['product_name'][:30]}...\n"
+        
+        return response
+
+    def execute_command(self, command_type, original_prompt):
+        try:
+            if command_type == 'restock_urgent':
+                return self.analyze_restock_urgent()
+            
+            elif command_type == 'restock_all':
+                return self.analyze_all_restock()
+            
+            elif command_type == 'top_products':
+                return self.get_top_products(by='quantity')
+            
+            elif command_type == 'top_revenue':
+                return self.get_top_products(by='revenue')
+            
+            elif command_type == 'prediction':
+                days = self.extract_days_from_prompt(original_prompt)
+                return self.predict_demand(days=days)
+            
+            elif command_type == 'trend':
+                return self.get_sales_trend()
+            
+            elif command_type == 'summary':
+                return self.get_comprehensive_summary()
+            
+            elif command_type == 'help':
+                return self.show_natural_help()
+            
+            elif command_type == 'stock_most':
+                return self.analyze_stock_most()
+            
+            elif command_type == 'stock_least':
+                return self.analyze_stock_least()
+            
+        except Exception as e:
+            return f"Error memproses permintaan: {str(e)}"
+        
+        def show_natural_help(self):
+            """Tampilkan help yang natural"""
+            help_text = """
+            CARA BERINTERAKSI DENGAN SAYA:
+
+            Anda bisa tanya dengan bahasa natural seperti:
+
+            Tentang Stok & Restock:
+            - Produk apa yang butuh restock segera?
+            - Stok mana yang hampir habis?
+            - Stok paling sedikit / paling dikit
+            - Stok paling banyak / stok terbanyak
+            - Butuh restock apa aja?
+            - Analisis stok toko saya
+
+            Tentang Penjualan:
+            - Produk apa yang paling laris?
+            - Produk dengan pendapatan tertinggi
+            - Yang paling banyak duitnya
+
+            Tentang Prediksi:
+            - Prediksi penjualan 30 hari kedepan
+            - Ramalan 2 minggu
+            - Perkiraan permintaan bulan depan
+
+            Tentang Analisis:
+            - Bagaimana tren penjualan?
+            - Penjualan naik atau turun?
+            - Analisis perkembangan toko
+
+            Laporan Lengkap:
+            - Kasih laporan lengkap
+            - Summary toko saya
+            - Semua analisis
+
+            Bantuan:
+            - Bisa ngapain aja?
+            - Fitur apa yang ada?
+            - Help
+            - Menu
+
+            Contoh: 
+            - Stok paling dikit
+            - Produk yang stoknya banyak
+            - Yang harus direstock segera
+            """
+            return help_text
+
+    def extract_days_from_prompt(self, prompt):
+        """Extract jumlah hari dari prompt natural"""
+        import re
+        numbers = re.findall(r'\b(\d+)\b', prompt)
+        if numbers:
+            return min(int(numbers[0]), 90)  # Maksimal 90 hari
+        return 30  # Default 30 hari
+
+    def handle_unknown_prompt(self, prompt):
+        """Handle prompt yang tidak dikenali"""
+        responses = [
+            f"Saya tidak yakin memahami '{prompt}'. Coba tanyakan tentang: Restock produk, Produk terlaris, Prediksi penjualan, atau Tren penjualan",
+            f"Maaf, saya belum paham maksud '{prompt}'. Bisa tanya tentang analisis stok atau penjualan?",
+            f"Untuk '{prompt}', coba gunakan kata kunci: restock, produk terlaris, prediksi, atau tren",
+        ]
+        import random
+        return random.choice(responses)
+
+    def get_comprehensive_summary(self):
+        """Ringkasan lengkap semua analisis"""
+        if not self.is_ready:
+            return "System not ready. Please wait..."
+        
+        response = "LAPORAN LENGKAP TOKO\n" + "="*50 + "\n\n"
+        
+        # 1. Restock urgent
+        response += "RESTOCK URGENT\n"
+        restock_needs = self.predictor.analyze_product_restock_needs(self.daily_sales_data)
+        urgent_products = [p for p in restock_needs if p['urgency'] == 'HIGH']
+        if urgent_products:
+            response += f"   {len(urgent_products)} produk butuh restock segera\n"
+            response += f"   Prioritas: {urgent_products[0]['product_name'][:30]}...\n"
+        else:
+            response += "   Semua produk aman\n"
+        
+        # 2. Top products
+        response += "\nPRODUK TERLARIS\n"
+        top_products = self.predictor.get_top_products_analysis(self.product_analysis)
+        if top_products.get('top_by_quantity'):
+            top_product = top_products['top_by_quantity'][0]
+            response += f"   {top_product.get('Nama Produk', 'Unknown')[:30]}...\n"
+            response += f"   Terjual: {top_product.get('Total_Quantity', 0):.0f} unit\n"
+        
+        # 3. Sales trend
+        response += "\nTREN PENJUALAN\n"
+        trend = self.predictor.generate_sales_trend_analysis(self.time_series_data)
+        if trend:
+            response += f"   {trend['trend_direction']}\n"
+            response += f"   Rata-rata: {trend['recent_avg_daily_sales']:.1f} unit/hari\n"
+        
+        # 4. Prediction
+        response += "\nPREDIKSI\n"
+        predictions = self.predictor.predict_demand(days=7)
+        if predictions:
+            avg_demand = sum(p['predicted_demand'] for p in predictions) / len(predictions)
+            response += f"   7 hari: {avg_demand:.1f} unit/hari\n"
+        
+        response += "\nREKOMENDASI\n"
+        if urgent_products:
+            response += f"   Restock {len(urgent_products)} produk urgent\n"
+        if trend and trend['trend_direction'] == 'INCREASING':
+            response += "   Penjualan naik, pertahankan!\n"
+        elif trend and trend['trend_direction'] == 'DECREASING':
+            response += "   Penjualan turun, evaluasi strategi\n"
+        
+        return response
     
     def auto_setup(self, dataset_path=None):  # ⬅️ PARAMETER DIPINDAH KE SINI
         """Setup otomatis dengan dataset real atau sample"""
@@ -55,7 +353,7 @@ class AutoMagicPredictor:
                 self.using_real_data = False
                 
         except Exception as e:
-            print(f"❌ Auto-setup error: {str(e)}")
+            print(f"Auto-setup error: {str(e)}")
     
     def create_auto_sample_data(self, days=180):
         """Buat sample data otomatis yang realistis"""
@@ -150,7 +448,7 @@ class AutoMagicPredictor:
     def analyze_all_restock(self):
         """Analisis semua produk yang butuh restock"""
         if not self.is_ready:
-            return "❌ System not ready. Please wait..."
+            return "System not ready. Please wait..."
         
         restock_needs = self.predictor.analyze_product_restock_needs(self.daily_sales_data)
         
@@ -184,94 +482,100 @@ class AutoMagicPredictor:
         return response
     
     def get_top_products(self, by='quantity'):
-        """Dapatkan produk terlaris"""
         if not self.is_ready:
-            return "❌ System not ready. Please wait..."
+            return "System not ready. Please wait..."
         
         top_products = self.predictor.get_top_products_analysis(self.product_analysis)
         
         if by == 'revenue':
-            products = top_products.get('top_by_revenue', [])[:5]
-            title = "💰 PRODUK TERLARIS BY REVENUE"
+            products = top_products.get('top_by_revenue', [])
+            title = "PRODUK TERLARIS BY REVENUE"
         else:
-            products = top_products.get('top_by_quantity', [])[:5]
-            title = "🏆 PRODUK TERLARIS BY QUANTITY"
+            products = top_products.get('top_by_quantity', [])
+            title = "PRODUK TERLARIS BY QUANTITY"
+        
+        if not products:
+            return f"{title}\nTidak ada data produk terlaris"
         
         response = f"{title}\n\n"
         
-        for i, product in enumerate(products, 1):
-            response += f"{i}. **{product['Nama Produk']}**\n"
-            response += f"    Terjual: {product['Total_Quantity']:.0f} unit\n"
-            response += f"   💰 Revenue: Rp {product['Total_Revenue']:,.0f}\n"
-            response += f"   🛒 Transaksi: {product['Transaction_Count']}x\n\n"
+        for i, product in enumerate(products[:5], 1):
+            product_name = product.get('Nama Produk', 'Unknown Product')
+            quantity = product.get('Total_Quantity', 0)
+            revenue = product.get('Total_Revenue', 0)
+            transactions = product.get('Transaction_Count', 0)
+            
+            response += f"{i}. {product_name}\n"
+            response += f"   Terjual: {quantity:.0f} unit\n"
+            response += f"   Revenue: Rp {revenue:,.0f}\n"
+            response += f"   Transaksi: {transactions}x\n\n"
         
         return response
     
     def predict_demand(self, days=30):
-        """Prediksi demand ke depan - FIXED"""
         if not self.is_ready:
-            return "❌ System not ready. Please wait..."
+            return "System not ready. Please wait..."
         
         results = self.predictor.predict_and_recommend(days=days)
         
         if not results:
-            return "❌ Prediction failed."
+            return "Prediction failed."
         
-        response = f"  **PREDIKSI {days} HARI KE DEPAN**\n\n"
+        response = f"PREDIKSI {days} HARI KE DEPAN\n\n"
         
         # Key metrics
         predictions = results.get('predictions', [])
         if predictions:
             avg_demand = sum(p['predicted_demand'] for p in predictions) / len(predictions)
             
-            response += f" **Key Metrics:**\n"
-            response += f"   • Rata-rata demand: {avg_demand:.1f} unit/hari\n"
-            response += f"   • Total prediksi demand: {sum(p['predicted_demand'] for p in predictions):.0f} unit\n"
+            response += f"Key Metrics:\n"
+            response += f"   Rata-rata demand: {avg_demand:.1f} unit/hari\n"
+            response += f"   Total prediksi demand: {sum(p['predicted_demand'] for p in predictions):.0f} unit\n"
             
             # Check for urgent days
             recommendations = results.get('restock_recommendations', [])
             if recommendations:
                 urgent_days = sum(1 for r in recommendations if r['urgency'] == 'HIGH')
-                response += f"   • Hari butuh restock urgent: {urgent_days} hari\n"
+                response += f"   Hari butuh restock urgent: {urgent_days} hari\n"
             
             response += f"\n"
             
             # 5 days preview
-            response += f"📅 **5 Hari Pertama:**\n"
+            response += f"5 Hari Pertama:\n"
             for i, pred in enumerate(predictions[:5], 1):
                 urgency_info = ""
                 if recommendations:
                     for rec in recommendations:
                         if rec['date'] == pred['date']:
-                            urgency_info = f" {rec['urgency_color']}"
+                            urgency_info = f" {rec['urgency']}"
                             break
                 response += f"   {i}. {pred['date']}{urgency_info} {pred['predicted_demand']:.0f} unit\n"
         else:
-            response += "❌ Tidak ada data prediksi\n"
+            response += "Tidak ada data prediksi\n"
         
         return response
     
     def get_sales_trend(self):
-        """Analisis tren penjualan"""
+        """Analisis tren penjualan - tanpa emot"""
         if not self.is_ready:
-            return "❌ System not ready. Please wait..."
+            return "System not ready. Please wait..."
         
         trend_analysis = self.predictor.generate_sales_trend_analysis(self.time_series_data)
         
-        response = " **ANALISIS TREN PENJUALAN**\n\n"
+        response = "ANALISIS TREN PENJUALAN\n\n"
         
-        response += f" **Status Tren:** {trend_analysis['trend_icon']} {trend_analysis['trend_direction']}\n"
-        response += f" **Rata-rata Penjualan:** {trend_analysis['recent_avg_daily_sales']:.1f} unit/hari\n"
-        response += f"🎯 **Volatilitas:** {trend_analysis['volatility']:.1f}\n"
-        response += f"📅 **Periode Analisis:** {trend_analysis['analysis_period_days']} hari\n"
+        response += f"Status Tren: {trend_analysis['trend_direction']}\n"
+        response += f"Rata-rata Penjualan: {trend_analysis['recent_avg_daily_sales']:.1f} unit/hari\n"
+        response += f"Volatilitas: {trend_analysis['volatility']:.1f}\n"
+        response += f"Periode Analisis: {trend_analysis['analysis_period_days']} hari\n"
         
         # Interpretation
         if trend_analysis['trend_direction'] == 'INCREASING':
-            response += "\n **INTERPRETASI:** Penjualan sedang naik! Pertahankan performa."
+            response += "\nINTERPRETASI: Penjualan sedang naik! Pertahankan performa."
         elif trend_analysis['trend_direction'] == 'DECREASING':
-            response += "\n⚠️ **INTERPRETASI:** Penjualan sedang turun. Perlu evaluasi strategi."
+            response += "\nINTERPRETASI: Penjualan sedang turun. Perlu evaluasi strategi."
         else:
-            response += "\n➡️ **INTERPRETASI:** Penjualan stabil. Good job!"
+            response += "\nINTERPRETASI: Penjualan stabil. Good job!"
         
         return response
     
@@ -294,7 +598,7 @@ class AutoMagicPredictor:
                 self.using_real_data = False
             
             if self.dataset is None:
-                print("❌ Failed to load data")
+                print("Failed to load data")
                 return False
             
             print(" Auto-processing data...")
@@ -302,7 +606,7 @@ class AutoMagicPredictor:
                 self.preprocessor.preprocess_data(self.dataset)
             
             if self.time_series_data.empty:
-                print("❌ Processing failed - no time series data")
+                print("Processing failed - no time series data")
                 return False
             
             print(" Auto-training model...")
@@ -321,11 +625,11 @@ class AutoMagicPredictor:
                 self.show_dataset_info()
                 return True
             else:
-                print("❌ Auto-setup failed at model training")
+                print("Auto-setup failed at model training")
                 return False
                 
         except Exception as e:
-            print(f"❌ Auto-setup error: {str(e)}")
+            print(f"Auto-setup error: {str(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -347,7 +651,7 @@ class AutoMagicPredictor:
                     print(f" Found dataset: {file}")
                     return file
         
-        print("❌ No dataset found. Using sample data.")
+        print("No dataset found. Using sample data.")
         return None
     
     def auto_setup(self, dataset_path=None):
@@ -367,7 +671,7 @@ class AutoMagicPredictor:
                 self.using_real_data = False
             
             if self.dataset is None:
-                print("❌ Failed to load data")
+                print("Failed to load data")
                 return
             
             print(" Auto-processing data...")
@@ -375,7 +679,7 @@ class AutoMagicPredictor:
                 self.preprocessor.preprocess_data(self.dataset)
             
             if self.time_series_data.empty:
-                print("❌ Processing failed - no time series data")
+                print("Processing failed - no time series data")
                 return
             
             print(" Auto-training model...")
@@ -390,10 +694,10 @@ class AutoMagicPredictor:
                 # Show dataset info
                 self.show_dataset_info()
             else:
-                print("❌ Auto-setup failed at model training")
+                print("Auto-setup failed at model training")
                 
         except Exception as e:
-            print(f"❌ Auto-setup error: {str(e)}")
+            print(f"Auto-setup error: {str(e)}")
     
     def show_dataset_info(self):
         """Tampilkan info dataset yang digunakan"""
@@ -425,7 +729,7 @@ class AutoMagicPredictor:
     def get_top_products(self, by='quantity'):
         """Dapatkan produk terlaris - FIXED"""
         if not self.is_ready:
-            return "❌ System not ready. Please wait..."
+            return "System not ready. Please wait..."
         
         top_products = self.predictor.get_top_products_analysis(self.product_analysis)
         
@@ -437,7 +741,7 @@ class AutoMagicPredictor:
             title = "🏆 PRODUK TERLARIS BY QUANTITY"
         
         if not products:
-            return f"{title}\n\n❌ Tidak ada data produk terlaris"
+            return f"{title}\n\nTidak ada data produk terlaris"
         
         response = f"{title}\n\n"
         
@@ -455,86 +759,45 @@ class AutoMagicPredictor:
         return response
 
 def main():
+    """Main function dengan natural chat interface"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Shopee Auto-Magic Predictor')
     parser.add_argument('--dataset', '-d', type=str, help='Path to your dataset CSV file')
     args = parser.parse_args()
     
-    print("**SHOPEE AUTO-MAGIC PREDICTOR**")
-    print("System akan setup otomatis...")
-    
-    if args.dataset:
-        print(f" Using dataset: {args.dataset}")
-    else:
-        print(" Auto-searching for dataset...")
-    
+    print("SHOPEE AI ASSISTANT")
+    print("Saya adalah asisten AI untuk analisis toko Shopee Anda!")
+    print("Silakan tanyakan apa saja tentang stok, penjualan, dan prediksi toko Anda.")
     print("-" * 60)
     
-    predictor = AutoMagicPredictor() 
+    predictor = AutoMagicPredictor()
+    success = predictor.setup(args.dataset)
     
-    if args.dataset:
-        predictor.auto_setup(args.dataset)  
-    
-    if not predictor.is_ready:
+    if not success:
         print("System gagal setup. Coba lagi.")
         return
     
-    print("\n**SYSTEM READY!** Silakan tanyakan apa saja:")
-    print("• 'restock urgent' - Produk butuh restock segera")
-    print("• 'analisis restock' - Semua produk butuh restock") 
-    print("• 'produk terlaris' - Top produk by quantity")
-    print("• 'top revenue' - Top produk by revenue")
-    print("• 'prediksi' - Prediksi demand 30 hari")
-    print("• 'tren penjualan' - Analisis tren")
-    print("• 'semua' - Semua analisis sekaligus")
-    print("• 'exit' - Keluar")
-    print("-" * 60)
-    
     while True:
         try:
-            prompt = input("\n Tanya: ").strip().lower()
+            prompt = input("\nApa yang bisa saya bantu : ").strip()
             
-            if prompt in ['exit', 'quit', 'keluar']:
-                print("👋 Terima kasih!")
+            if prompt.lower() in ['exit', 'quit', 'keluar', 'bye', 'selesai']:
+                print("\nTerima kasih! Semoga toko Anda semakin sukses!")
                 break
             
             if not prompt:
                 continue
             
-            # Process prompt
-            if 'urgent' in prompt:
-                response = predictor.analyze_restock_urgent()
-            elif 'restock' in prompt:
-                response = predictor.analyze_all_restock()
-            elif 'revenue' in prompt:
-                response = predictor.get_top_products(by='revenue')
-            elif 'terlaris' in prompt or 'top' in prompt:
-                response = predictor.get_top_products(by='quantity')
-            elif 'prediksi' in prompt or 'ramal' in prompt:
-                # Extract days if any
-                days_match = re.search(r'(\d+)', prompt)
-                days = int(days_match.group(1)) if days_match else 30
-                response = predictor.predict_demand(days=days)
-            elif 'tren' in prompt or 'trend' in prompt:
-                response = predictor.get_sales_trend()
-            elif 'semua' in prompt or 'all' in prompt:
-                # Combine all analyses
-                response = " **LAPORAN LENGKAP**\n\n"
-                response += predictor.analyze_restock_urgent() + "\n" + "="*50 + "\n\n"
-                response += predictor.get_top_products() + "\n" + "="*50 + "\n\n"
-                response += predictor.predict_demand() + "\n" + "="*50 + "\n\n"
-                response += predictor.get_sales_trend()
-            else:
-                response = "❌ Tidak mengerti. Coba: 'restock urgent', 'produk terlaris', 'prediksi', dll."
-            
-            print(f"\n {response}")
+            response = predictor.process_natural_language(prompt)
+            print(f"\nAsisten: {response}")
             
         except KeyboardInterrupt:
-            print("\n👋 Sampai jumpa!")
+            print("\nSampai jumpa! Terima kasih telah menggunakan layanan kami.")
             break
         except Exception as e:
-            print(f"\n❌ Error: {str(e)}")
+            print(f"\nMaaf, ada error: {str(e)}")
+            print("Coba tanya lagi dengan pertanyaan yang berbeda.")
 
 if __name__ == "__main__":
     main()
