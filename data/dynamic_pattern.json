@@ -1,0 +1,22 @@
+{
+    "rekomendasi_restock": [
+        "restok",
+        "stok ulang",
+        "belanja lagi"
+    ],
+    "top_products": [
+        "produk terlaris",
+        "paling laku",
+        "item favorit"
+    ],
+    "trend_analysis": [
+        "analisa",
+        "hitungin",
+        "grafik jualan"
+    ],
+    "summary": [
+        "rekap toko",
+        "total jualan",
+        "ringkasan"
+    ]
+}

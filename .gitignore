@@ -1,0 +1,19 @@
+# Abaikan semua file di dalam folder models
+
+# Jika Anda ingin folder tetap ada di GitHub tapi isinya kosong,
+# gunakan aturan ini sebagai gantinya:
+models/*
+# !models/.gitkeep
+
+# Abaikan file binary model secara spesifik
+*.pkl
+*.joblib
+
+# Abaikan folder cache python
+__pycache__/
+*.py[cod]
+
+# Abaikan file environment dan data mentah
+.env
+data/raw/
+uploads/

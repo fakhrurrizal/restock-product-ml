@@ -1,213 +1,143 @@
+import joblib
+import os
 import pandas as pd
 import numpy as np
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import joblib
 import warnings
-warnings.filterwarnings('ignore')
-from config import Config
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from concurrent.futures import ProcessPoolExecutor
+from src.config import Config
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
 
 class ModelTrainer:
     def __init__(self):
         self.config = Config()
-        self.model = None
-        self.model_fit = None
-        self.model_type = None
-        self.is_trained = False
-        self.training_history = {}
-        self.time_series_data = None
-        self.product_analysis = None
-    
-    def train_arima(self, train_data, order=None):
-        """
-        Train model ARIMA
+        if not os.path.exists(self.config.MODEL_PATH):
+            os.makedirs(self.config.MODEL_PATH, exist_ok=True)
+
+    def auto_cleanup_models(self, active_skus):
+        """Menghapus model .pkl yang sudah tidak ada di dataset terbaru."""
+        print("\n[1/3] CLEANUP: Mengecek model tidak aktif...")
+        existing_files = os.listdir(self.config.MODEL_PATH)
+        active_safe_filenames = {f"{''.join([c if c.isalnum() else '_' for c in str(sku)])}.pkl" for sku in active_skus}
         
-        Args:
-            train_data (pd.Series): Data training
-            order (tuple): Parameter order ARIMA (p,d,q)
-            
-        Returns:
-            bool: Status training
-        """
+        deleted_count = 0
+        for file in existing_files:
+            if file.endswith(".pkl") and file not in active_safe_filenames:
+                try:
+                    os.remove(os.path.join(self.config.MODEL_PATH, file))
+                    deleted_count += 1
+                except:
+                    pass
+        if deleted_count > 0:
+            print(f"      Berhasil menghapus {deleted_count} model lama.")
+
+    def _train_worker(self, args):
+        """Worker function untuk melatih satu SKU."""
+        sku, daily_series, model_type, model_path = args
         try:
-            if order is None:
-                order = self.config.ARIMA_ORDER
+            data_values = daily_series.values.astype(float)
             
-            print(f" Training ARIMA model dengan order {order}...")
-            self.model = ARIMA(train_data, order=order)
-            self.model_fit = self.model.fit()
-            self.model_type = 'ARIMA'
-            self.is_trained = True
+            # Cek kecukupan data
+            if len(data_values[data_values > 0]) < 7:
+                return False, sku, "Data penjualan aktif < 7 hari"
+
+            model_fit = None
+            reason = "Unknown Error"
             
-            self.training_history = {
-                'model_type': 'ARIMA',
-                'order': order,
-                'aic': self.model_fit.aic,
-                'bic': self.model_fit.bic,
-                'training_data_points': len(train_data)
-            }
-            
-            print(" ARIMA model training berhasil")
-            return True
-            
+            # STRATEGI 1: Utama
+            try:
+                if model_type.upper() == "SARIMA":
+                    model = SARIMAX(data_values, 
+                                    order=(1, 1, 1), 
+                                    seasonal_order=(1, 1, 0, 7) if len(data_values) > 14 else None,
+                                    enforce_stationarity=False, 
+                                    enforce_invertibility=False)
+                else:
+                    model = SARIMAX(data_values, order=(1, 1, 1))
+                
+                model_fit = model.fit(disp=False, maxiter=50)
+                
+                # Validasi Forecast
+                test_check = model_fit.get_forecast(steps=1).predicted_mean
+                if np.isnan(test_check) or test_check[0] > 10000 or test_check[0] < 0:
+                    model_fit = None
+                    reason = "Hasil tidak masuk akal (NaN/Outlier)"
+            except Exception as e:
+                model_fit = None
+                reason = f"Gagal konvergensi: {str(e)}"
+
+            # STRATEGI 2: Auto-Recovery
+            if model_fit is None:
+                try:
+                    model_alt = SARIMAX(data_values, order=(1, 0, 0))
+                    model_fit = model_alt.fit(disp=False, maxiter=30)
+                except Exception as e:
+                    return False, sku, f"Recovery gagal: {str(e)}"
+
+            # Simpan Model
+            if model_fit:
+                safe_sku = "".join([c if c.isalnum() else "_" for c in str(sku)])
+                file_path = os.path.join(model_path, f"{safe_sku}.pkl")
+                joblib.dump(model_fit, file_path)
+                return True, sku, "Success"
+                
         except Exception as e:
-            print(f"Error training ARIMA: {str(e)}")
-            return False
-    
-    def train_sarima(self, train_data, order=None, seasonal_order=None):
-        """Train model SARIMA"""
-        try:
-            if order is None:
-                order = self.config.SARIMA_ORDER
-            if seasonal_order is None:
-                seasonal_order = self.config.SARIMA_SEASONAL_ORDER
-            
-            print(f" Training SARIMA model dengan order {order} dan seasonal order {seasonal_order}...")
-            self.model = SARIMAX(
-                train_data, 
-                order=order, 
-                seasonal_order=seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False
-            )
-            self.model_fit = self.model.fit(disp=False)
-            self.model_type = 'SARIMA'
-            self.is_trained = True
-            
-            self.training_history = {
-                'model_type': 'SARIMA',
-                'order': order,
-                'seasonal_order': seasonal_order,
-                'aic': self.model_fit.aic,
-                'bic': self.model_fit.bic,
-                'training_data_points': len(train_data)
-            }
-            
-            # ⬇️ SIMPAN DATA TRAINING UNTUK REFERENSI
-            self.time_series_data = train_data
-            
-            print(" SARIMA model training berhasil")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error training SARIMA: {str(e)}")
-            return False
-    
-    def evaluate_model(self, test_data):
-        """
-        Evaluate model performance
+            return False, sku, f"System Error: {str(e)}"
         
-        Args:
-            test_data (pd.Series): Data testing
-            
-        Returns:
-            dict: Metrics evaluasi
-        """
-        if not self.is_trained:
-            return None
+        return False, sku, reason
+
+    def train_all(self, raw_df, model_type="SARIMA"):
+        """Melatih semua SKU dengan visual progress bar."""
+        df = raw_df.copy()
+
+        # Identifikasi Kolom
+        c_sku = next((c for c in df.columns if 'SKU' in c), None)
+        c_qty = next((c for c in df.columns if 'Jumlah' in c), None)
+        c_time = next((c for c in df.columns if 'Waktu' in c or 'Tanggal' in c), None)
+
+        if not all([c_sku, c_qty, c_time]):
+            return 0, [{"sku": "N/A", "reason": "Kolom tidak ditemukan"}]
+
+        # Preprocessing Data Global
+        df[c_time] = pd.to_datetime(df[c_time], errors='coerce')
+        df[c_sku] = df[c_sku].astype(str).str.strip()
+        df = df.dropna(subset=[c_time, c_sku])
+        df = df[~df[c_sku].isin(['-', '', 'nan', 'None'])]
+
+        unique_skus = df[c_sku].unique()
         
-        try:
-            # Forecast untuk periode testing
-            forecast = self.model_fit.forecast(steps=len(test_data))
+        # 1. Cleanup
+        self.auto_cleanup_models(unique_skus)
+
+        # 2. Persiapan Task (Preprocessing per SKU)
+        print(f"\n[2/3] PREPROCESS: Menyiapkan data untuk {len(unique_skus)} SKU...")
+        tasks = []
+        for sku in tqdm(unique_skus, desc="      Progres Preprocessing", unit="sku"):
+            sku_data = df[df[c_sku] == sku]
+            daily_series = sku_data.set_index(c_time)[c_qty].resample('D').sum().fillna(0)
+            tasks.append((sku, daily_series, model_type, self.config.MODEL_PATH))
+
+        # 3. Training Paralel
+        print(f"\n[3/3] TRAINING: Melatih model {model_type.upper()} via Multi-Core...")
+        trained_count = 0
+        failed_details = []
+
+        with ProcessPoolExecutor() as executor:
+            # Menggunakan tqdm untuk memantau hasil dari executor
+            results = list(tqdm(
+                executor.map(self._train_worker, tasks),
+                total=len(tasks),
+                desc="      Progres Training     ",
+                unit="model"
+            ))
             
-            # Calculate metrics
-            mae = mean_absolute_error(test_data, forecast)
-            rmse = np.sqrt(mean_squared_error(test_data, forecast))
-            mape = np.mean(np.abs((test_data - forecast) / test_data)) * 100
-            
-            evaluation_metrics = {
-                'MAE': round(mae, 2),
-                'RMSE': round(rmse, 2),
-                'MAPE': round(mape, 2),
-                'predictions': forecast.tolist(),
-                'actual': test_data.tolist(),
-                'test_periods': len(test_data)
-            }
-            
-            print(f" Model Evaluation:")
-            print(f"   MAE: {evaluation_metrics['MAE']}")
-            print(f"   RMSE: {evaluation_metrics['RMSE']}")
-            print(f"   MAPE: {evaluation_metrics['MAPE']}%")
-            
-            return evaluation_metrics
-            
-        except Exception as e:
-            print(f"❌ Error evaluating model: {str(e)}")
-            return None
-    
-    def save_model(self, filename=None):
-        """
-        Save trained model
-        
-        Args:
-            filename (str): Nama file model
-            
-        Returns:
-            str: Path model yang disimpan
-        """
-        if not self.is_trained:
-            print("❌ Model belum ditraining")
-            return None
-        
-        try:
-            if filename is None:
-                timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
-                filename = f"{self.model_type}_model_{timestamp}.joblib"
-            
-            model_path = os.path.join(self.config.MODELS_DIR, filename)
-            
-            # Save model dan metadata
-            model_data = {
-                'model_fit': self.model_fit,
-                'model_type': self.model_type,
-                'training_history': self.training_history,
-                'config': {
-                    'model_type': self.model_type,
-                    'order': self.training_history.get('order'),
-                    'seasonal_order': self.training_history.get('seasonal_order')
-                }
-            }
-            
-            joblib.dump(model_data, model_path)
-            print(f"💾 Model disimpan di: {model_path}")
-            return model_path
-            
-        except Exception as e:
-            print(f"❌ Error saving model: {str(e)}")
-            return None
-    
-    def load_model(self, filepath):
-        """
-        Load trained model
-        
-        Args:
-            filepath (str): Path menuju file model
-            
-        Returns:
-            bool: Status loading
-        """
-        try:
-            if not os.path.exists(filepath):
-                print(f"❌ File model tidak ditemukan: {filepath}")
-                return False
-            
-            model_data = joblib.load(filepath)
-            self.model_fit = model_data['model_fit']
-            self.model_type = model_data['model_type']
-            self.training_history = model_data['training_history']
-            self.is_trained = True
-            
-            print(f" Model {self.model_type} berhasil diload")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error loading model: {str(e)}")
-            return False
-    
-    def get_model_summary(self):
-        """Mendapatkan summary model"""
-        if not self.is_trained:
-            return "Model belum ditraining"
-        
-        return self.model_fit.summary()
+            for is_success, sku_name, reason in results:
+                if is_success:
+                    trained_count += 1
+                else:
+                    failed_details.append({"sku": sku_name, "reason": reason})
+
+        print(f"\n[DONE] Selesai: {trained_count} Berhasil, {len(failed_details)} Gagal.")
+        return trained_count, failed_details

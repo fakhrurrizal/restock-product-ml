@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from config import Config
+from src.config import Config
 
 class DataPreprocessor:
     def __init__(self):
@@ -112,7 +112,7 @@ class DataPreprocessor:
             df_transformed['Jumlah'] = pd.to_numeric(df_transformed[qty_col], errors='coerce')
         else:
             print("      ⚠️ No quantity column found")
-            df_transformed['Jumlah'] = 1  # Default quantity
+            df_transformed['Jumlah'] = 1 
         
         # Auto-detect kolom produk
         product_columns = [col for col in df_transformed.columns if 'produk' in col.lower() or 'product' in col.lower() or 'nama' in col.lower()]
@@ -151,17 +151,15 @@ class DataPreprocessor:
         if 'Tanggal' not in df.columns:
             return pd.DataFrame()
         
-        # Aggregasi harian
         daily_agg = df.groupby('Tanggal').agg({
             self.config.TARGET_COLUMN: 'sum',
             'Total Pembayaran': 'sum',
-            'Nama Produk': 'count'  # Jumlah transaksi
+            'Nama Produk': 'count'
         }).reset_index()
         
         daily_agg.columns = ['Tanggal', 'Total_Quantity', 'Total_Revenue', 'Transaction_Count']
         daily_agg['Tanggal'] = pd.to_datetime(daily_agg['Tanggal'])
         
-        # Buat time series lengkap
         full_date_range = pd.date_range(
             start=daily_agg['Tanggal'].min(),
             end=daily_agg['Tanggal'].max(),
@@ -171,7 +169,6 @@ class DataPreprocessor:
         time_series = pd.DataFrame({'Tanggal': full_date_range})
         time_series = time_series.merge(daily_agg, on='Tanggal', how='left')
         
-        # Fill missing values dengan 0
         numeric_cols = ['Total_Quantity', 'Total_Revenue', 'Transaction_Count']
         time_series[numeric_cols] = time_series[numeric_cols].fillna(0)
         
