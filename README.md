@@ -12,3 +12,6 @@ Service backend berbasis AI untuk prediksi stok otomatis menggunakan algoritma *
 3. **Run Server**: Jalankan Server:
    ```bash
    python main.py
+4. **Open Documentation**: Jalankan Server:
+   ```bash
+   http://localhost:8000/docs
