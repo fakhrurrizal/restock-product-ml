@@ -1,6 +1,6 @@
 # AI Stock Service
 
-Service backend berbasis AI untuk prediksi stok otomatis menggunakan algoritma **SARIMA** dan **Chatbot Konsultasi**.
+Service backend berbasis AI untuk prediksi stok otomatis menggunakan algoritma **SARIMA** atau **ARIMA** dan **Chatbot Konsultasi**.
 
 ---
 
