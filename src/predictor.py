@@ -89,41 +89,40 @@ class RestockPredictor:
                 json.dump(dynamic_data, f, indent=4)
             self.keywords = self._load_all_patterns()
 
-    def get_forecast(self, sku_id):
-        """Mengambil prediksi 7 hari ke depan dengan sistem Cache RAM"""
-        if not sku_id or str(sku_id).lower() in ['nan', '-', 'none']: 
-            return 0
+    def get_forecast_series(self, sku_id):
+        """Mengambil detail prediksi 7 hari ke depan (H+1 sampai H+7)"""
+        if not sku_id: return []
         
-        # Penanganan Cache
+        # Logic LRU Cache
         if sku_id in self.model_cache:
-            self.model_cache.move_to_end(sku_id) # Geser ke paling baru digunakan
+            self.model_cache.move_to_end(sku_id)
             model = self.model_cache[sku_id]
         else:
             safe_sku = "".join([c if c.isalnum() else "_" for c in str(sku_id)])
             filename = f"{safe_sku}.pkl"
-            
-            if filename not in self.available_models: 
-                return 0
-                
+            if filename not in self.available_models: return []
             try:
                 model = joblib.load(os.path.join(self.config.MODEL_PATH, filename))
                 self.model_cache[sku_id] = model
-                
-                # Hapus cache yang paling jarang digunakan jika overlimit
                 if len(self.model_cache) > self.cache_limit:
                     self.model_cache.popitem(last=False)
-            except: 
-                return 0
-            
+            except: return []
+
         try:
             forecast = model.get_forecast(steps=7)
-            res = np.sum(forecast.predicted_mean)
-            return int(round(max(0, res)))
-        except: 
-            return 0
+            # Format untuk Recharts: [{"name": "H+1", "value": 10}, ...]
+            return [{"name": f"H+{i+1}", "value": int(round(max(0, val)))} 
+                    for i, val in enumerate(forecast.predicted_mean)]
+        except: return []
+
+    def get_forecast(self, sku_id):
+        """Mengambil total prediksi 7 hari ke depan (sum)"""
+        series = self.get_forecast_series(sku_id)
+        if not series: return 0
+        return sum(item['value'] for item in series)
 
     def process_natural_language(self, request_input, product_info, daily_sales_dict, raw_df):
-        """Engine NLP untuk memproses chat dan memberikan output sesuai tipe data"""
+        """Engine NLP untuk memproses chat dan memberikan output visual (Table + Multi-Chart)"""
         if isinstance(request_input, dict):
             prompt = request_input.get("message", "")
         else:
@@ -140,7 +139,7 @@ class RestockPredictor:
                 command_type = p_type
                 break
 
-        # Pembelajaran Dinamis jika kata kunci tidak baku ditemukan
+        # Pembelajaran Dinamis
         if not command_type:
             if any(x in prompt_lower for x in ['hitung', 'itungan', 'itungin']):
                 command_type = 'trend_analysis'
@@ -152,7 +151,7 @@ class RestockPredictor:
         if not command_type:
             return {
                 "type": "text", "status": "error",
-                "message": f"Maaf, saya tidak mengenali perintah: '{prompt}'. Coba tanya 'Produk terlaris' atau 'Restock'."
+                "message": f"Maaf, saya tidak mengenali perintah: '{prompt}'. Coba tanya 'Produk terlaris' atau 'Rekomendasi restock'."
             }
 
         # Deteksi Kolom Dinamis
@@ -164,13 +163,11 @@ class RestockPredictor:
         c_bayar = next((c for c in raw_df.columns if 'Total' in c or 'Bayar' in c), 'Total Pembayaran')
 
         df_work = raw_df.copy()
-        # Perbaikan Variasi Kosong
         df_work[c_var] = df_work[c_var].fillna('-').replace('', '-')
-        
         if not pd.api.types.is_datetime64_any_dtype(df_work[c_waktu]):
             df_work[c_waktu] = pd.to_datetime(df_work[c_waktu], errors='coerce')
 
-        # Filter Waktu Sederhana
+        # Filter Waktu
         months_id = {'januari':1, 'februari':2, 'maret':3, 'april':4, 'mei':5, 'juni':6,
                      'juli':7, 'agustus':8, 'september':9, 'oktober':10, 'november':11, 'desember':12}
         detected_months = [m for m in months_id if m in prompt_lower]
@@ -184,53 +181,89 @@ class RestockPredictor:
             df_work = df_work[df_work[c_waktu].dt.month == months_id[detected_months[0]]]
             time_label = f"Bulan {detected_months[0].title()}"
 
-        # 1. Output Produk Terlaris
+        # 1. Output Produk Terlaris (Table + Bar Chart)
         if command_type == 'top_products':
             res = df_work.groupby([c_nama, c_var, c_sku]).agg({c_qty: 'sum'}).reset_index()
             res = res.sort_values(by=c_qty, ascending=False).head(limit)
+            
+            chart_data = [{"name": f"{r[c_nama]}", "value": int(r[c_qty])} for _, r in res.iterrows()]
+            
             return {
-                "type": "table", "status": "success",
+                "type": "multi_visual", "status": "success",
                 "message": f"Daftar {limit} Produk Terlaris ({time_label}):",
-                "data": [{"produk": r[c_nama], "variasi": r[c_var], "sku": r[c_sku], "total": int(r[c_qty])} for _, r in res.iterrows()]
+                "data": [{"produk": r[c_nama], "variasi": r[c_var], "sku": r[c_sku], "total": int(r[c_qty])} for _, r in res.iterrows()],
+                "charts": [
+                    {"title": "Volume Penjualan Teratas", "type": "bar", "data": chart_data}
+                ]
             }
 
-        # 2. Output Rekomendasi Restock (Membutuhkan model .pkl)
+        # 2. Output Rekomendasi Restock (Table + Line Chart Forecast)
         if command_type == 'rekomendasi_restock':
             unique_prods = df_work.groupby([c_nama, c_var, c_sku])[c_qty].sum().reset_index().sort_values(by=c_qty, ascending=False).head(50)
             results = []
+            all_charts = []
+            
             for _, row in unique_prods.iterrows():
-                f_val = self.get_forecast(row[c_sku])
-                if f_val > 0:
+                forecast_data = self.get_forecast_series(row[c_sku])
+                if forecast_data:
+                    f_total = sum(d['value'] for d in forecast_data)
                     results.append({
                         "sku": row[c_sku], "nama_produk": row[c_nama], "variasi": row[c_var],
-                        "prediksi_7_hari": f_val,
-                        "urgensi": "KRITIS" if f_val > (row[c_qty]/4) else "NORMAL"
+                        "prediksi_7_hari": f_total,
+                        "urgensi": "KRITIS" if f_total > (row[c_qty]/4) else "NORMAL"
                     })
+                    # Ambil 2 chart saja untuk restock agar tidak overload di UI
+                    if len(all_charts) < 2:
+                        all_charts.append({
+                            "title": f"Forecast: {row[c_nama][:20]}",
+                            "type": "line",
+                            "data": forecast_data
+                        })
+            
             return {
-                "type": "table", "status": "success",
-                "message": "Rekomendasi Restock 7 Hari Ke Depan:",
-                "data": sorted(results, key=lambda x: x['prediksi_7_hari'], reverse=True)[:limit]
+                "type": "multi_visual", "status": "success",
+                "message": "Analisis Prediksi Stok 7 Hari Ke Depan:",
+                "data": sorted(results, key=lambda x: x['prediksi_7_hari'], reverse=True)[:limit],
+                "charts": all_charts
             }
 
-        # 3. Output Analisis Tren
+        # 3. Output Analisis Tren (Table + Line Chart Historis)
         if command_type == 'trend_analysis':
-            trend = df_work.groupby([c_nama, c_var, c_sku])[c_qty].sum().reset_index().sort_values(by=c_qty, ascending=False).head(limit)
+            # Ambil tren harian global
+            daily_trend = df_work.groupby(df_work[c_waktu].dt.date)[c_qty].sum().reset_index()
+            daily_trend.columns = ['date', 'qty']
+            chart_data = [{"name": str(r['date']), "value": int(r['qty'])} for _, r in daily_trend.tail(15).iterrows()]
+            
+            res_table = df_work.groupby([c_nama, c_var, c_sku])[c_qty].sum().reset_index().sort_values(by=c_qty, ascending=False).head(limit)
+            
             return {
-                "type": "table", "status": "success",
+                "type": "multi_visual", "status": "success",
                 "message": f"Analisis Tren Penjualan Periode {time_label}:",
-                "data": [{"produk": r[c_nama], "variasi": r[c_var], "total": int(r[c_qty])} for _, r in trend.iterrows()]
+                "data": [{"produk": r[c_nama], "variasi": r[c_var], "total": int(r[c_qty])} for _, r in res_table.iterrows()],
+                "charts": [
+                    {"title": "Grafik Penjualan 15 Hari Terakhir", "type": "line", "data": chart_data}
+                ]
             }
 
-        # 4. Output Ringkasan (Card)
+        # 4. Output Ringkasan (Card + Mix Visualization)
         if command_type == 'summary':
+            summary_data = {
+                "total_terjual": int(df_work[c_qty].sum()),
+                "omzet": f"Rp {int(df_work[c_bayar].sum()):,}",
+                "produk_unik": int(df_work[c_sku].nunique())
+            }
+            # Chart untuk omzet mingguan (jika data cukup)
+            df_work['week'] = df_work[c_waktu].dt.isocalendar().week
+            weekly_omzet = df_work.groupby('week')[c_bayar].sum().tail(5).reset_index()
+            chart_omzet = [{"name": f"W-{r['week']}", "value": int(r[c_bayar])} for _, r in weekly_omzet.iterrows()]
+
             return {
-                "type": "summary_card", "status": "success",
+                "type": "multi_visual", "status": "success",
                 "message": f"Ringkasan Performa Toko ({time_label}):",
-                "data": {
-                    "total_terjual": int(df_work[c_qty].sum()),
-                    "omzet": f"Rp {int(df_work[c_bayar].sum()):,}",
-                    "produk_unik": int(df_work[c_sku].nunique())
-                }
+                "summary": summary_data,
+                "charts": [
+                    {"title": "Performa Omzet Mingguan", "type": "bar", "data": chart_omzet}
+                ]
             }
 
     def extract_number(self, text):
