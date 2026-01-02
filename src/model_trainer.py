@@ -17,8 +17,6 @@ class ModelTrainer:
             os.makedirs(self.config.MODEL_PATH, exist_ok=True)
 
     def auto_cleanup_models(self, active_skus):
-        """Menghapus model .pkl yang sudah tidak ada di dataset terbaru."""
-        print("\n[1/3] CLEANUP: Mengecek model tidak aktif...")
         existing_files = os.listdir(self.config.MODEL_PATH)
         active_safe_filenames = {f"{''.join([c if c.isalnum() else '_' for c in str(sku)])}.pkl" for sku in active_skus}
         
@@ -30,23 +28,18 @@ class ModelTrainer:
                     deleted_count += 1
                 except:
                     pass
-        if deleted_count > 0:
-            print(f"      Berhasil menghapus {deleted_count} model lama.")
+        return deleted_count
 
     def _train_worker(self, args):
-        """Worker function untuk melatih satu SKU."""
         sku, daily_series, model_type, model_path = args
         try:
             data_values = daily_series.values.astype(float)
-            
-            # Cek kecukupan data
             if len(data_values[data_values > 0]) < 7:
                 return False, sku, "Data penjualan aktif < 7 hari"
 
             model_fit = None
             reason = "Unknown Error"
             
-            # STRATEGI 1: Utama
             try:
                 if model_type.upper() == "SARIMA":
                     model = SARIMAX(data_values, 
@@ -58,8 +51,6 @@ class ModelTrainer:
                     model = SARIMAX(data_values, order=(1, 1, 1))
                 
                 model_fit = model.fit(disp=False, maxiter=50)
-                
-                # Validasi Forecast
                 test_check = model_fit.get_forecast(steps=1).predicted_mean
                 if np.isnan(test_check) or test_check[0] > 10000 or test_check[0] < 0:
                     model_fit = None
@@ -68,7 +59,6 @@ class ModelTrainer:
                 model_fit = None
                 reason = f"Gagal konvergensi: {str(e)}"
 
-            # STRATEGI 2: Auto-Recovery
             if model_fit is None:
                 try:
                     model_alt = SARIMAX(data_values, order=(1, 0, 0))
@@ -76,7 +66,6 @@ class ModelTrainer:
                 except Exception as e:
                     return False, sku, f"Recovery gagal: {str(e)}"
 
-            # Simpan Model
             if model_fit:
                 safe_sku = "".join([c if c.isalnum() else "_" for c in str(sku)])
                 file_path = os.path.join(model_path, f"{safe_sku}.pkl")
@@ -88,11 +77,9 @@ class ModelTrainer:
         
         return False, sku, reason
 
-    def train_all(self, raw_df, model_type="SARIMA"):
-        """Melatih semua SKU dengan visual progress bar."""
+    def train_all(self, raw_df, model_type="SARIMA", callback=None):
         df = raw_df.copy()
 
-        # Identifikasi Kolom
         c_sku = next((c for c in df.columns if 'SKU' in c), None)
         c_qty = next((c for c in df.columns if 'Jumlah' in c), None)
         c_time = next((c for c in df.columns if 'Waktu' in c or 'Tanggal' in c), None)
@@ -100,44 +87,36 @@ class ModelTrainer:
         if not all([c_sku, c_qty, c_time]):
             return 0, [{"sku": "N/A", "reason": "Kolom tidak ditemukan"}]
 
-        # Preprocessing Data Global
         df[c_time] = pd.to_datetime(df[c_time], errors='coerce')
         df[c_sku] = df[c_sku].astype(str).str.strip()
         df = df.dropna(subset=[c_time, c_sku])
         df = df[~df[c_sku].isin(['-', '', 'nan', 'None'])]
 
         unique_skus = df[c_sku].unique()
+        total_skus = len(unique_skus)
         
-        # 1. Cleanup
         self.auto_cleanup_models(unique_skus)
 
-        # 2. Persiapan Task (Preprocessing per SKU)
-        print(f"\n[2/3] PREPROCESS: Menyiapkan data untuk {len(unique_skus)} SKU...")
         tasks = []
-        for sku in tqdm(unique_skus, desc="      Progres Preprocessing", unit="sku"):
+        for sku in tqdm(unique_skus, desc="Preprocessing Data", unit="sku"):
             sku_data = df[df[c_sku] == sku]
             daily_series = sku_data.set_index(c_time)[c_qty].resample('D').sum().fillna(0)
             tasks.append((sku, daily_series, model_type, self.config.MODEL_PATH))
 
-        # 3. Training Paralel
-        print(f"\n[3/3] TRAINING: Melatih model {model_type.upper()} via Multi-Core...")
         trained_count = 0
         failed_details = []
 
         with ProcessPoolExecutor() as executor:
-            # Menggunakan tqdm untuk memantau hasil dari executor
-            results = list(tqdm(
-                executor.map(self._train_worker, tasks),
-                total=len(tasks),
-                desc="      Progres Training     ",
-                unit="model"
-            ))
+            futures = executor.map(self._train_worker, tasks)
             
-            for is_success, sku_name, reason in results:
+            for i, result in enumerate(tqdm(futures, total=total_skus, desc="Training Models"), 1):
+                is_success, sku_name, reason = result
                 if is_success:
                     trained_count += 1
                 else:
                     failed_details.append({"sku": sku_name, "reason": reason})
+                
+                if callback:
+                    callback(i, total_skus)
 
-        print(f"\n[DONE] Selesai: {trained_count} Berhasil, {len(failed_details)} Gagal.")
         return trained_count, failed_details

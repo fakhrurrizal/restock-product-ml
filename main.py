@@ -1,10 +1,14 @@
 import os
 import shutil
 import uvicorn
-import multiprocessing
+import glob
+import json
+import asyncio
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from typing import List, Optional, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.data_loader import DataLoader
@@ -27,17 +31,16 @@ app.add_middleware(
 state = {
     "analysis": None,
     "daily_sales": None,
-    "raw_df": None
+    "raw_df": None,
+    "progress": {"percent": 0, "status": "Idle"}
 }
 
 predictor = RestockPredictor()
 
 def load_existing_data():
-    """Memuat data otomatis ke RAM. Hanya dipanggil oleh proses utama."""
     file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
     if os.path.exists(file_path):
         try:
-            print(f"\n[STARTUP] Memuat dataset aktif: {file_path}")
             df = DataLoader().load_data(file_path)
             preprocessor = DataPreprocessor()
             _, daily_sales, product_analysis = preprocessor.preprocess_data(df)
@@ -46,65 +49,78 @@ def load_existing_data():
                 state["analysis"] = product_analysis
                 state["daily_sales"] = daily_sales
                 state["raw_df"] = df
-                print("[STARTUP] Sukses memuat data lama ke RAM\n")
         except Exception as e:
-            print(f"[STARTUP] Gagal memuat data lama: {str(e)}")
+            print(f"Error loading existing data: {e}")
+
+class ChatHistoryItem(BaseModel):
+    user: str
+    bot: Optional[str] = None
+    data: Optional[List[Any]] = None
 
 class ChatInput(BaseModel):
     message: str
+    history: Optional[List[ChatHistoryItem]] = []
 
-@app.post("/upload-train")
-async def upload_and_auto_train(
-    file: UploadFile = File(...), 
-    model_type: str = Query("SARIMA", enum=["SARIMA", "ARIMA"])
-):
-    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
+def run_training_process(file_path: str, model_type: str):
+    global state
     try:
+        state["progress"] = {"percent": 5, "status": "Membaca data..."}
         df = DataLoader().load_data(file_path)
+        
+        state["progress"] = {"percent": 15, "status": "Preprocessing data..."}
         preprocessor = DataPreprocessor()
         _, daily_sales, product_analysis = preprocessor.preprocess_data(df)
         
         state["analysis"] = product_analysis
         state["daily_sales"] = daily_sales
         state["raw_df"] = df
-        
+
+        state["progress"] = {"percent": 30, "status": f"Training {model_type} dimulai..."}
         trainer = ModelTrainer()
-        trained_count, failed_list = trainer.train_all(df, model_type=model_type) 
+        
+        def progress_callback(current, total):
+            p = 30 + int((current / total) * 65)
+            state["progress"] = {"percent": p, "status": f"Training {current}/{total} SKU..."}
+
+        trainer.train_all(df, model_type=model_type, callback=progress_callback) 
         
         predictor.available_models = predictor._refresh_model_list()
-        model_files = sorted(list(predictor.available_models))
-        
-        sku_col = next((c for c in df.columns if 'SKU' in c), "SKU")
-        total_unique_sku = df[sku_col].nunique()
+        state["progress"] = {"percent": 100, "status": "Selesai"}
 
-        return {
-            "status": "Success",
-            "message": f"Proses selesai menggunakan algoritma {model_type}",
-            "execution_summary": {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "model_algorithm": model_type,
-                "total_sku_detected": int(total_unique_sku),
-                "total_models_created": int(trained_count),
-                "total_failed": int(len(failed_list)),
-                "source_file": file.filename
-            },
-            "failed_details": failed_list,
-            "output_details": [
-                {
-                    "sku_file": m,
-                    "status": "Active/Ready",
-                    "last_updated": datetime.now().strftime("%Y-%m-%d")
-                } for m in model_files
-            ]
-        }
     except Exception as e:
-        print(f"Upload & Train Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Gagal memproses data: {str(e)}")
+        state["progress"] = {"percent": 0, "status": f"Error: {str(e)}"}
+
+@app.get("/train-progress")
+async def train_progress():
+    async def event_generator():
+        while True:
+            yield f"data: {json.dumps(state['progress'])}\n\n"
+            if state["progress"]["percent"] >= 100 or "Error" in state["progress"]["status"]:
+                break
+            await asyncio.sleep(0.8) 
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/upload-train")
+async def upload_and_auto_train(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    model_type: str = Query("SARIMA", enum=["SARIMA", "ARIMA"])
+):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Hanya file CSV yang diperbolehkan")
+
+    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
+    state["progress"] = {"percent": 0, "status": "Inisialisasi upload..."}
+    
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal menyimpan file: {str(e)}")
+    
+    background_tasks.add_task(run_training_process, file_path, model_type)
+    return {"status": "Started", "message": "Proses training berjalan."}
 
 @app.post("/chat")
 async def chat_with_ai(input: ChatInput):
@@ -112,26 +128,56 @@ async def chat_with_ai(input: ChatInput):
         return {
             "type": "text", 
             "status": "error",
-            "message": "Data belum diunggah. Silakan upload file CSV terlebih dahulu."
+            "message": "Model belum siap. Silakan upload dataset terlebih dahulu."
         }
     
     try:
         response = predictor.process_natural_language(
-            request_input=input.model_dump(),
+            request_input={
+                "message": input.message,
+                "history": [h.dict() for h in input.history]
+            },
             product_info=state["analysis"], 
             daily_sales_dict=state["daily_sales"],
             raw_df=state["raw_df"]
         )
         return response
     except Exception as e:
-        print(f"Chat Engine Error: {str(e)}")
-        return {"type": "text", "status": "error", "message": f"Kesalahan internal: {str(e)}"}
+        return {"type": "text", "status": "error", "message": f"Kesalahan internal AI: {str(e)}"}
+    
+@app.get("/check-status")
+async def check_status():
+    is_ready = state["raw_df"] is not None
+    return {
+        "is_trained": is_ready,
+        "total_sku": len(state["analysis"]) if is_ready else 0,
+        "last_status": state["progress"]["status"]
+    }
+
+@app.delete("/reset-data")
+async def reset_data():
+    global state
+    try:
+        file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        model_files = glob.glob(os.path.join("models", "*"))
+        for f in model_files:
+            if os.path.isfile(f):
+                os.remove(f)
+        
+        state.update({
+            "analysis": None,
+            "daily_sales": None,
+            "raw_df": None,
+            "progress": {"percent": 0, "status": "Idle"}
+        })
+        predictor.available_models = []
+        return {"message": "Data berhasil dihapus"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    
     load_existing_data()
-    
-    # 3. Jalankan Uvicorn
-    print("AI Stock Service is Starting")
     uvicorn.run(app, host="0.0.0.0", port=8000)
