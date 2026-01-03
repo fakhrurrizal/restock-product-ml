@@ -34,7 +34,7 @@ state = {
     "analysis": None,
     "daily_sales": None,
     "raw_df": None,
-    "progress": {"percent": 0, "status": "Idle"}
+    "progress": {"percent": 0, "status": "Membaca File..."}
 }
 
 predictor = RestockPredictor()
@@ -180,7 +180,7 @@ async def reset_data():
             "analysis": None,
             "daily_sales": None,
             "raw_df": None,
-            "progress": {"percent": 0, "status": "Idle"}
+            "progress": {"percent": 0, "status": "Membaca File..."}
         })
         predictor.available_models = []
         return {"message": "Data berhasil dihapus"}
