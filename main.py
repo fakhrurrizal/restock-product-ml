@@ -100,7 +100,14 @@ async def train_progress():
             if state["progress"]["percent"] >= 100 or "Error" in state["progress"]["status"]:
                 break
             await asyncio.sleep(0.8) 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no" 
+        })
 
 @app.post("/upload-train")
 async def upload_and_auto_train(
