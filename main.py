@@ -30,10 +30,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 state = {
     "analysis": None,
     "daily_sales": None,
     "raw_df": None,
+    "global_metrics": {},
+    "trained_details": [],
+    "model_info": {
+        "model_type": None,
+        "order": "(1, 1, 1)",
+        "seasonal_order": "(1, 1, 1, 7)"
+    },
     "progress": {"percent": 0, "status": "Membaca File..."}
 }
 
@@ -66,6 +74,7 @@ class ChatInput(BaseModel):
 def run_training_process(file_path: str, model_type: str):
     global state
     try:
+        state["model_info"]["model_type"] = model_type
         state["progress"] = {"percent": 5, "status": "Membaca data..."}
         df = DataLoader().load_data(file_path)
         
@@ -84,7 +93,14 @@ def run_training_process(file_path: str, model_type: str):
             p = 30 + int((current / total) * 65)
             state["progress"] = {"percent": p, "status": f"Training {current}/{total} SKU..."}
 
-        trainer.train_all(df, model_type=model_type, callback=progress_callback) 
+        count, failed, details, global_eval = trainer.train_all(
+            df, 
+            model_type=model_type, 
+            callback=progress_callback
+        ) 
+        
+        state["trained_details"] = details
+        state["global_metrics"] = global_eval
         
         predictor.available_models = predictor._refresh_model_list()
         state["progress"] = {"percent": 100, "status": "Selesai"}
@@ -157,10 +173,23 @@ async def chat_with_ai(input: ChatInput):
 @app.get("/check-status")
 async def check_status():
     is_ready = state["raw_df"] is not None
+    total_processed = len(state["analysis"]) if is_ready else 0
+    success_count = len(state["trained_details"])
+    
     return {
         "is_trained": is_ready,
-        "total_sku": len(state["analysis"]) if is_ready else 0,
-        "last_status": state["progress"]["status"]
+        "total_sku": total_processed,
+        "last_status": state["progress"]["status"],
+        "model_info": {
+            "selected_model": state["model_info"]["model_type"],
+            "order": state["model_info"]["order"],
+            "seasonal_order": state["model_info"]["seasonal_order"] if state["model_info"]["model_type"] == "SARIMA" else None
+        },
+        "global_evaluation": state["global_metrics"],
+        "summary": {
+            "success": success_count,
+            "failed": max(0, total_processed - success_count)
+        }
     }
 
 @app.delete("/reset-data")
@@ -180,6 +209,9 @@ async def reset_data():
             "analysis": None,
             "daily_sales": None,
             "raw_df": None,
+            "global_metrics": {},
+            "trained_details": [],
+            "model_info": {"model_type": None, "order": "(1, 1, 1)", "seasonal_order": "(1, 1, 1, 7)"},
             "progress": {"percent": 0, "status": "Membaca File..."}
         })
         predictor.available_models = []
