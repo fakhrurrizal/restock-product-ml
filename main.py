@@ -45,6 +45,9 @@ state = {
     "progress": {"percent": 0, "status": "Membaca File..."}
 }
 
+training_event = asyncio.Event()
+is_training_active = False
+
 predictor = RestockPredictor()
 
 def load_existing_data():
@@ -71,8 +74,11 @@ class ChatInput(BaseModel):
     message: str
     history: Optional[List[ChatHistoryItem]] = []
 
-def run_training_process(file_path: str, model_type: str):
-    global state
+async def run_training_process(file_path: str, model_type: str):
+    global state, is_training_active
+    is_training_active = True
+    training_event.set() 
+    
     try:
         state["model_info"]["model_type"] = model_type
         state["progress"] = {"percent": 5, "status": "Membaca data..."}
@@ -90,6 +96,9 @@ def run_training_process(file_path: str, model_type: str):
         trainer = ModelTrainer()
         
         def progress_callback(current, total):
+            if not training_event.is_set():
+                raise Exception("STOP_REQUESTED")
+                
             p = 30 + int((current / total) * 65)
             state["progress"] = {"percent": p, "status": f"Training {current}/{total} SKU..."}
 
@@ -101,19 +110,24 @@ def run_training_process(file_path: str, model_type: str):
         
         state["trained_details"] = details
         state["global_metrics"] = global_eval
-        
         predictor.available_models = predictor._refresh_model_list()
         state["progress"] = {"percent": 100, "status": "Selesai"}
 
     except Exception as e:
-        state["progress"] = {"percent": 0, "status": f"Error: {str(e)}"}
+        if str(e) == "STOP_REQUESTED":
+            state["progress"] = {"percent": 0, "status": "Training dihentikan"}
+            await reset_data()
+        else:
+            state["progress"] = {"percent": 0, "status": f"Error: {str(e)}"}
+    finally:
+        is_training_active = False
 
 @app.get("/train-progress")
 async def train_progress():
     async def event_generator():
         while True:
             yield f"data: {json.dumps(state['progress'])}\n\n"
-            if state["progress"]["percent"] >= 100 or "Error" in state["progress"]["status"]:
+            if state["progress"]["percent"] >= 100 or state["progress"]["percent"] == 0:
                 break
             await asyncio.sleep(0.8) 
     return StreamingResponse(
@@ -146,6 +160,14 @@ async def upload_and_auto_train(
     
     background_tasks.add_task(run_training_process, file_path, model_type)
     return {"status": "Started", "message": "Proses training berjalan."}
+
+@app.post("/stop-training")
+async def stop_training():
+    global is_training_active
+    if is_training_active:
+        training_event.clear()
+        return {"message": "permintaan penghentian dikirim"}
+    return {"message": "Tidak ada proses training yang aktif"}
 
 @app.post("/chat")
 async def chat_with_ai(input: ChatInput):
