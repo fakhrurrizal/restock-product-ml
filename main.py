@@ -191,6 +191,14 @@ async def check_status():
             "failed": max(0, total_processed - success_count)
         }
     }
+    
+@app.post("/stop-training")
+async def stop_training():
+    global is_training_active
+    if is_training_active:
+        training_event.clear()
+        return {"message": "Permintaan penghentian dikirim"}
+    return {"message": "Tidak ada proses training yang aktif"}
 
 @app.delete("/reset-data")
 async def reset_data():
