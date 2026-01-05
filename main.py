@@ -4,12 +4,14 @@ import uvicorn
 import glob
 import json
 import asyncio
+import gc
 from datetime import datetime
 from typing import List, Optional, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from multiprocessing import Manager
 
 from src.data_loader import DataLoader
 from src.data_preprocessor import DataPreprocessor
@@ -42,12 +44,42 @@ state = {
         "order": "(1, 1, 1)",
         "seasonal_order": "(1, 1, 1, 7)"
     },
-    "progress": {"percent": 0, "status": "Membaca File..."}
+    "progress": {"percent": 0, "status": "Ready"}
 }
 
-training_event = asyncio.Event()
+mp_manager = None
+training_active_flag = None
 is_training_active = False
 predictor = RestockPredictor()
+
+async def internal_cleanup():
+    global state
+    try:
+        file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        model_files = glob.glob(os.path.join(config.MODEL_PATH, "*.pkl"))
+        for f in model_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        
+        state.update({
+            "analysis": None,
+            "daily_sales": None,
+            "raw_df": None,
+            "global_metrics": {},
+            "trained_details": [],
+            "model_info": {"model_type": None, "order": "(1, 1, 1)", "seasonal_order": "(1, 1, 1, 7)"},
+            "progress": {"percent": 0, "status": "Ready"}
+        })
+        predictor.available_models = []
+        gc.collect()
+        return True
+    except Exception as e:
+        return False
 
 def load_existing_data():
     file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
@@ -61,8 +93,8 @@ def load_existing_data():
                 state["analysis"] = product_analysis
                 state["daily_sales"] = daily_sales
                 state["raw_df"] = df
-        except Exception as e:
-            print(f"Error loading existing data: {e}")
+        except:
+            pass
 
 class ChatHistoryItem(BaseModel):
     user: str
@@ -74,14 +106,17 @@ class ChatInput(BaseModel):
     history: Optional[List[ChatHistoryItem]] = []
 
 async def run_training_process(file_path: str, model_type: str):
-    global state, is_training_active
+    global state, is_training_active, training_active_flag
     is_training_active = True
-    training_event.set() 
+    
+    if training_active_flag is not None:
+        training_active_flag.value = True
     
     try:
         state["model_info"]["model_type"] = model_type
-        state["progress"] = {"percent": 5, "status": "Membaca data..."}
-        df = DataLoader().load_data(file_path)
+        state["progress"] = {"percent": 1, "status": "Inisialisasi..."}
+        
+        df = await asyncio.to_thread(DataLoader().load_data, file_path)
         
         state["progress"] = {"percent": 15, "status": "Preprocessing data..."}
         preprocessor = DataPreprocessor()
@@ -95,18 +130,16 @@ async def run_training_process(file_path: str, model_type: str):
         trainer = ModelTrainer()
         
         def progress_callback(current, total):
-            if not training_event.is_set():
-                raise InterruptedError("STOP_REQUESTED")
-                
             p = 30 + int((current / total) * 65)
             state["progress"] = {"percent": p, "status": f"Training {current}/{total} SKU..."}
 
-        count, failed, details, global_eval = trainer.train_all(
-            df, 
-            model_type=model_type, 
-            callback=progress_callback
+        count, failed, details, global_eval = await asyncio.to_thread(
+            trainer.train_all, df, model_type, progress_callback, training_active_flag
         ) 
         
+        if training_active_flag and not training_active_flag.value:
+            raise InterruptedError("STOP_REQUESTED")
+
         state["trained_details"] = details
         state["global_metrics"] = global_eval
         predictor.available_models = predictor._refresh_model_list()
@@ -114,7 +147,6 @@ async def run_training_process(file_path: str, model_type: str):
 
     except InterruptedError:
         state["progress"] = {"percent": 0, "status": "Training dihentikan"}
-        await reset_data()
     except Exception as e:
         state["progress"] = {"percent": 0, "status": f"Error: {str(e)}"}
     finally:
@@ -124,10 +156,24 @@ async def run_training_process(file_path: str, model_type: str):
 async def train_progress():
     async def event_generator():
         while True:
-            yield f"data: {json.dumps(state['progress'])}\n\n"
-            if state["progress"]["percent"] >= 100 or state["progress"]["status"] == "Training dihentikan":
+            current_progress = state["progress"]
+            yield f"data: {json.dumps(current_progress)}\n\n"
+            
+            status_lower = current_progress["status"].lower()
+            
+            if current_progress["percent"] >= 100 or "error" in status_lower:
                 break
-            await asyncio.sleep(0.8) 
+                
+            if "dihentikan" in status_lower or "sedang menghentikan" in status_lower:
+                await asyncio.sleep(1)
+                state["progress"] = {"percent": 0, "status": "Ready"}
+                break
+            
+            if current_progress["percent"] == 0 and status_lower == "ready" and not is_training_active:
+                break
+                
+            await asyncio.sleep(0.5) 
+            
     return StreamingResponse(
         event_generator(), 
         media_type="text/event-stream",
@@ -137,59 +183,20 @@ async def train_progress():
             "X-Accel-Buffering": "no" 
         })
 
-@app.post("/upload-train")
-async def upload_and_auto_train(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...), 
-    model_type: str = Query("SARIMA", enum=["SARIMA", "ARIMA"])
-):
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Hanya file CSV yang diperbolehkan")
-
-    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
-    state["progress"] = {"percent": 0, "status": "Inisialisasi upload..."}
-    
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal menyimpan file: {str(e)}")
-    
-    background_tasks.add_task(run_training_process, file_path, model_type)
-    return {"status": "Started", "message": "Proses training berjalan."}
-
-@app.post("/chat")
-async def chat_with_ai(input: ChatInput):
-    if state["raw_df"] is None:
-        return {
-            "type": "text", 
-            "status": "error",
-            "message": "Model belum siap. Silakan upload dataset terlebih dahulu."
-        }
-    
-    try:
-        response = predictor.process_natural_language(
-            request_input={
-                "message": input.message,
-                "history": [h.dict() for h in input.history]
-            },
-            product_info=state["analysis"], 
-            daily_sales_dict=state["daily_sales"],
-            raw_df=state["raw_df"]
-        )
-        return response
-    except Exception as e:
-        return {"type": "text", "status": "error", "message": f"Kesalahan internal AI: {str(e)}"}
-
 @app.get("/check-status")
 async def check_status():
-    is_ready = state["raw_df"] is not None
-    total_processed = len(state["analysis"]) if is_ready else 0
-    success_count = len(state["trained_details"])
+    available_models = predictor._refresh_model_list()
+    is_trained = (state["raw_df"] is not None and 
+                  state["analysis"] is not None and 
+                  len(available_models) > 0)
     
+    total_processed = len(state["analysis"]) if state["analysis"] is not None else 0
+    success_count = len(state["trained_details"])
+    global_metrics = state["global_metrics"] if state["global_metrics"] else {"mae": None, "rmse": None, "mape": "N/A"}
+
     return {
-        "is_trained": is_ready,
+        "is_trained": is_trained,
+        "is_active": is_training_active,
         "total_sku": total_processed,
         "last_status": state["progress"]["status"],
         "model_info": {
@@ -197,7 +204,7 @@ async def check_status():
             "order": state["model_info"]["order"],
             "seasonal_order": state["model_info"]["seasonal_order"] if state["model_info"]["model_type"] == "SARIMA" else None
         },
-        "global_evaluation": state["global_metrics"],
+        "global_evaluation": global_metrics,
         "summary": {
             "success": success_count,
             "failed": max(0, total_processed - success_count)
@@ -206,39 +213,69 @@ async def check_status():
 
 @app.post("/stop-training")
 async def stop_training():
-    global is_training_active
+    global is_training_active, training_active_flag
+    if is_training_active and training_active_flag is not None:
+        training_active_flag.value = False
+        await asyncio.sleep(1)
+        await internal_cleanup()
+        is_training_active = False
+        state["progress"] = {"percent": 0, "status": "Training dihentikan"}
+        return {"status": "stopping"}
+    return {"status": "idle"}
+
+@app.post("/upload-train")
+async def upload_and_auto_train(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    model_type: str = Query("SARIMA", enum=["SARIMA", "ARIMA"])
+):
+    global is_training_active, training_active_flag
     if is_training_active:
-        training_event.clear()
-        return {"message": "Permintaan penghentian dikirim dan data akan dibersihkan"}
-    return {"message": "Tidak ada proses training yang aktif"}
+        raise HTTPException(status_code=400, detail="Training sedang berjalan.")
+
+    if not file.filename.lower().endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Hanya file CSV yang diperbolehkan")
+
+    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    if training_active_flag is not None:
+        training_active_flag.value = True
+        
+    state["progress"] = {"percent": 1, "status": "Memulai..."}
+    background_tasks.add_task(run_training_process, file_path, model_type)
+    return {"status": "Started"}
+
+@app.post("/chat")
+async def chat_with_ai(input: ChatInput):
+    if state["raw_df"] is None:
+        return {"type": "text", "status": "error", "message": "Data belum siap."}
+    
+    try:
+        response = await asyncio.to_thread(
+            predictor.process_natural_language,
+            {"message": input.message, "history": [h.dict() for h in input.history]},
+            state["analysis"], state["daily_sales"], state["raw_df"]
+        )
+        return response
+    except:
+        return {"type": "text", "status": "error", "message": "Kesalahan AI"}
 
 @app.delete("/reset-data")
 async def reset_data():
-    global state
-    try:
-        file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        
-        model_files = glob.glob(os.path.join("models", "*"))
-        for f in model_files:
-            if os.path.isfile(f):
-                os.remove(f)
-        
-        state.update({
-            "analysis": None,
-            "daily_sales": None,
-            "raw_df": None,
-            "global_metrics": {},
-            "trained_details": [],
-            "model_info": {"model_type": None, "order": "(1, 1, 1)", "seasonal_order": "(1, 1, 1, 7)"},
-            "progress": {"percent": 0, "status": "Membaca File..."}
-        })
-        predictor.available_models = []
-        return {"message": "Data dan model berhasil dibersihkan"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    global is_training_active, training_active_flag
+    if is_training_active and training_active_flag is not None:
+        training_active_flag.value = False
+        await asyncio.sleep(1)
+        is_training_active = False
+    success = await internal_cleanup()
+    return {"message": "Data dibersihkan"} if success else {"message": "Gagal"}
 
 if __name__ == "__main__":
+    mp_manager = Manager()
+    training_active_flag = mp_manager.Value('b', True)
     load_existing_data()
     uvicorn.run(app, host="0.0.0.0", port=8000)

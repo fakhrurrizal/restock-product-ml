@@ -4,12 +4,12 @@ import pandas as pd
 import numpy as np
 import warnings
 import gc
+import multiprocessing
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.holtwinters import SimpleExpSmoothing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from src.config import Config
-from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -62,7 +62,6 @@ class ModelTrainer:
             test_data = data_values[split_idx:]
             
             model_fit = None
-            reason = "Unknown Error"
 
             try:
                 if model_type.upper() == "SARIMA" and len(train_data) > 14:
@@ -74,7 +73,7 @@ class ModelTrainer:
                 else:
                     model = SARIMAX(train_data, order=(1, 1, 1), enforce_stationarity=False)
                 
-                model_fit = model.fit(disp=False, maxiter=20)
+                model_fit = model.fit(disp=False, maxiter=20, low_memory=True)
                 predictions = model_fit.get_forecast(steps=len(test_data)).predicted_mean
                 
                 mae = mean_absolute_error(test_data, predictions)
@@ -87,16 +86,16 @@ class ModelTrainer:
                     "mape": f"{round(float(mape), 2)}%"
                 }
 
-            except Exception as e:
+            except Exception:
                 try:
                     model_alt = SimpleExpSmoothing(train_data).fit(smoothing_level=0.3, optimized=False)
                     model_fit = model_alt
                     stats["metrics"] = {"mae": 0, "rmse": 0, "mape": "N/A (Fallback)"}
-                except:
+                except Exception as e:
                     return False, sku, f"Training gagal: {str(e)}", stats
 
             if model_fit:
-                final_model = SARIMAX(data_values, order=(1,1,1), enforce_stationarity=False).fit(disp=False, maxiter=10)
+                final_model = SARIMAX(data_values, order=(1,1,1), enforce_stationarity=False).fit(disp=False, maxiter=10, low_memory=True)
                 safe_sku = "".join([c if c.isalnum() else "_" for c in str(sku)])
                 file_path = os.path.join(model_path, f"{safe_sku}.pkl")
                 joblib.dump(final_model, file_path)
@@ -108,9 +107,9 @@ class ModelTrainer:
         except Exception as e:
             return False, sku, f"System Error: {str(e)}", {}
         
-        return False, sku, reason, stats
+        return False, sku, "Unknown Error", stats
 
-    def train_all(self, raw_df, model_type="SARIMA", callback=None):
+    def train_all(self, raw_df, model_type="SARIMA", callback=None, stop_flag=None):
         df = raw_df.copy()
 
         c_sku = next((c for c in df.columns if 'SKU' in c), None)
@@ -148,38 +147,58 @@ class ModelTrainer:
         for s in inactive_skus:
             failed_details.append({"sku": s, "reason": "Data terlalu sedikit (< 4 transaksi)", "stats": {}})
 
-        max_workers = 2 
-        
+        cpu_count = multiprocessing.cpu_count()
+        max_workers = max(1, cpu_count - 1)
+
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = executor.map(self._train_worker, tasks)
+            futures = [executor.submit(self._train_worker, task) for task in tasks]
             
-            for i, result in enumerate(tqdm(futures, total=len(tasks), desc="Training Models"), 1):
-                is_success, sku_name, reason, stats = result
-                if is_success:
-                    trained_count += 1
-                    
-                    if stats.get("metrics") and isinstance(stats["metrics"]["mape"], str) and "%" in stats["metrics"]["mape"]:
-                        all_mae.append(stats["metrics"]["mae"])
-                        all_rmse.append(stats["metrics"]["rmse"])
-                        all_mape.append(float(stats["metrics"]["mape"].replace('%', '')))
-                    
-                    trained_details.append({
-                        "sku": sku_name,
-                        "metrics": stats.get("metrics"),
-                        "stats": stats
-                    })
-                else:
-                    failed_details.append({
-                        "sku": sku_name, 
-                        "reason": reason,
-                        "stats": stats if stats else {}
-                    })
-                
-                if callback:
-                    callback(i, len(tasks))
-                
-                if i % 20 == 0:
-                    gc.collect()
+            try:
+                for i, future in enumerate(as_completed(futures), 1):
+                    if stop_flag is not None and not stop_flag.value:
+                        for f in futures:
+                            f.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise InterruptedError("STOP_REQUESTED")
+
+                    try:
+                        result = future.result()
+                        is_success, sku_name, reason, stats = result
+                        
+                        if is_success:
+                            trained_count += 1
+                            if stats.get("metrics") and isinstance(stats["metrics"]["mape"], str) and "%" in stats["metrics"]["mape"]:
+                                all_mae.append(stats["metrics"]["mae"])
+                                all_rmse.append(stats["metrics"]["rmse"])
+                                try:
+                                    val_mape = float(stats["metrics"]["mape"].replace('%', ''))
+                                    all_mape.append(val_mape)
+                                except: pass
+                            
+                            trained_details.append({
+                                "sku": sku_name,
+                                "metrics": stats.get("metrics"),
+                                "stats": stats
+                            })
+                        else:
+                            failed_details.append({
+                                "sku": sku_name, 
+                                "reason": reason,
+                                "stats": stats if stats else {}
+                            })
+                        
+                        if callback:
+                            callback(i, len(tasks))
+                            
+                    except Exception as e:
+                        failed_details.append({"sku": "Process Error", "reason": str(e), "stats": {}})
+
+                    if i % 50 == 0:
+                        gc.collect()
+            except InterruptedError:
+                raise
+            except Exception as e:
+                failed_details.append({"sku": "Executor Error", "reason": str(e), "stats": {}})
 
         global_metrics = {
             "mae": round(float(np.mean(all_mae)), 2) if all_mae else 0,
