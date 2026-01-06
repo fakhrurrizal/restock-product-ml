@@ -160,37 +160,20 @@ async def train_progress():
             yield f"data: {json.dumps(current_progress)}\n\n"
             
             status_lower = current_progress["status"].lower()
-            
             if current_progress["percent"] >= 100 or "error" in status_lower:
                 break
-                
-            if "dihentikan" in status_lower or "sedang menghentikan" in status_lower:
+            if "dihentikan" in status_lower:
                 await asyncio.sleep(1)
-                state["progress"] = {"percent": 0, "status": "Ready"}
                 break
-            
-            if current_progress["percent"] == 0 and status_lower == "ready" and not is_training_active:
-                break
-                
             await asyncio.sleep(0.5) 
-            
-    return StreamingResponse(
-        event_generator(), 
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no" 
-        })
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/check-status")
 async def check_status():
     available_models = predictor._refresh_model_list()
-    is_trained = (state["raw_df"] is not None and 
-                  state["analysis"] is not None and 
-                  len(available_models) > 0)
-    
+    is_trained = (state["raw_df"] is not None and state["analysis"] is not None and len(available_models) > 0)
     total_processed = len(state["analysis"]) if state["analysis"] is not None else 0
+    total_rows = len(state["raw_df"]) if state["raw_df"] is not None else 0
     success_count = len(state["trained_details"])
     global_metrics = state["global_metrics"] if state["global_metrics"] else {"mae": None, "rmse": None, "mape": "N/A"}
 
@@ -198,6 +181,7 @@ async def check_status():
         "is_trained": is_trained,
         "is_active": is_training_active,
         "total_sku": total_processed,
+        "total_rows": total_rows,
         "last_status": state["progress"]["status"],
         "model_info": {
             "selected_model": state["model_info"]["model_type"],
@@ -216,11 +200,10 @@ async def stop_training():
     global is_training_active, training_active_flag
     if is_training_active and training_active_flag is not None:
         training_active_flag.value = False
-        await asyncio.sleep(1)
+        state["progress"] = {"percent": 0, "status": "Training dihentikan"}
         await internal_cleanup()
         is_training_active = False
-        state["progress"] = {"percent": 0, "status": "Training dihentikan"}
-        return {"status": "stopping"}
+        return {"status": "stopped"}
     return {"status": "idle"}
 
 @app.post("/upload-train")
@@ -229,23 +212,12 @@ async def upload_and_auto_train(
     file: UploadFile = File(...), 
     model_type: str = Query("SARIMA", enum=["SARIMA", "ARIMA"])
 ):
-    global is_training_active, training_active_flag
+    global is_training_active
     if is_training_active:
         raise HTTPException(status_code=400, detail="Training sedang berjalan.")
-
-    if not file.filename.lower().endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Hanya file CSV yang diperbolehkan")
-
-    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
     file_path = os.path.join(config.UPLOAD_DIR, "active_dataset.csv")
-    
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
-    if training_active_flag is not None:
-        training_active_flag.value = True
-        
-    state["progress"] = {"percent": 1, "status": "Memulai..."}
     background_tasks.add_task(run_training_process, file_path, model_type)
     return {"status": "Started"}
 
@@ -253,26 +225,22 @@ async def upload_and_auto_train(
 async def chat_with_ai(input: ChatInput):
     if state["raw_df"] is None:
         return {"type": "text", "status": "error", "message": "Data belum siap."}
-    
-    try:
-        response = await asyncio.to_thread(
-            predictor.process_natural_language,
-            {"message": input.message, "history": [h.dict() for h in input.history]},
-            state["analysis"], state["daily_sales"], state["raw_df"]
-        )
-        return response
-    except:
-        return {"type": "text", "status": "error", "message": "Kesalahan AI"}
+    response = await asyncio.to_thread(
+        predictor.process_natural_language,
+        {"message": input.message, "history": [h.dict() for h in input.history]},
+        state["analysis"], state["daily_sales"], state["raw_df"]
+    )
+    return response
 
 @app.delete("/reset-data")
 async def reset_data():
     global is_training_active, training_active_flag
     if is_training_active and training_active_flag is not None:
         training_active_flag.value = False
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
         is_training_active = False
-    success = await internal_cleanup()
-    return {"message": "Data dibersihkan"} if success else {"message": "Gagal"}
+    await internal_cleanup()
+    return {"message": "Data dibersihkan"}
 
 if __name__ == "__main__":
     mp_manager = Manager()
