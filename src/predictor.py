@@ -23,6 +23,7 @@ class RestockPredictor:
         return set()
 
     def _load_all_patterns(self):
+        # Menambahkan kategori 'sales_report' dan memperluas keyword lainnya
         base_patterns = {
             'inventory_check': [
                 'stok awal', 'stok akhir', 'sisa stok', 'posisi stok', 'mutasi', 
@@ -37,12 +38,12 @@ class RestockPredictor:
                 'terlaris', 'laku', 'best seller', 'top', 'banyak', 'terbanyak', 
                 'unggulan', 'favorit', 'juara', 'populer', 'paling', 'item utama',
                 'paling laku', 'penjualan tertinggi', 'produk emas', 'terjual',
-                'pendapatan tertinggi', 'penjualan tertinggi', 'omzet'
+                'pendapatan tertinggi', 'penjualan tertinggi', 'omzet', 'penjualan'
             ],
             'trend_analysis': [
                 'tren', 'analisa', 'analisis', 'grafik', 'perkembangan', 'historis', 
                 'performa', 'evaluasi', 'laporan', 'statistik', 'riwayat', 'naik turun',
-                'tracking', 'pantau', 'cek data', 'perbandingan'
+                'tracking', 'pantau', 'cek data', 'perbandingan', 'data penjualan', 'transaksi'
             ],
             'summary': [
                 'ringkasan', 'summary', 'overview', 'dashboard', 'total', 'rekap', 
@@ -79,7 +80,8 @@ class RestockPredictor:
             except: return []
         try:
             forecast = model.get_forecast(steps=steps)
-            return [{"name": f"H+{i+1}", "value": int(round(max(0, float(val))))} 
+            # Menggunakan float agar nilai kecil tidak langsung menjadi 0 di grafik
+            return [{"name": f"H+{i+1}", "value": float(max(0, val))} 
                     for i, val in enumerate(forecast.predicted_mean)]
         except: return []
 
@@ -105,10 +107,14 @@ class RestockPredictor:
         command_type = None
         is_revenue_context = False
 
-        for p_type in self.keywords:
-            if any(word in prompt_lower for word in self.keywords[p_type]):
-                command_type = p_type
-                break
+        # Urutan pengecekan: Trend analysis dicek lebih dulu jika ada kata 'data penjualan' atau 'tren'
+        if any(word in prompt_lower for word in ['tren', 'grafik', 'data penjualan']):
+            command_type = 'trend_analysis'
+        else:
+            for p_type in self.keywords:
+                if any(word in prompt_lower for word in self.keywords[p_type]):
+                    command_type = p_type
+                    break
         
         if any(x in prompt_lower for x in ['pendapatan', 'omzet', 'rupiah', 'bayar']):
             is_revenue_context = True
@@ -125,6 +131,7 @@ class RestockPredictor:
         if not command_type:
             return {"type": "text", "status": "error", "message": f"Maaf, perintah '{prompt}' tidak dikenali."}
 
+        # Standarisasi kolom
         c_sku = next((c for c in raw_df.columns if 'SKU' in c), 'Nomor Referensi SKU')
         c_qty = next((c for c in raw_df.columns if 'Jumlah' in c), 'Jumlah')
         c_nama = next((c for c in raw_df.columns if 'Nama Produk' in c), 'Nama Produk')
@@ -133,10 +140,12 @@ class RestockPredictor:
         c_bayar = next((c for c in raw_df.columns if 'Total' in c or 'Bayar' in c), 'Total Pembayaran')
 
         df_work = raw_df.copy()
+        df_work[c_qty] = pd.to_numeric(df_work[c_qty], errors='coerce').fillna(0)
         df_work[c_var] = df_work[c_var].fillna('-').replace('', '-')
         df_work[c_waktu] = pd.to_datetime(df_work[c_waktu], errors='coerce')
         df_work[c_bayar] = pd.to_numeric(df_work[c_bayar].astype(str).str.replace(r'[^0-9.]', '', regex=True), errors='coerce').fillna(0)
 
+        # Logika deteksi bulan
         months_id = {'januari':1, 'februari':2, 'maret':3, 'april':4, 'mei':5, 'juni':6, 'juli':7, 'agustus':8, 'september':9, 'oktober':10, 'november':11, 'desember':12}
         detected_months = [months_id[w] for w in re.findall(r'\w+', prompt_lower) if w in months_id]
 
@@ -171,9 +180,10 @@ class RestockPredictor:
             return {"type": "multi_visual", "status": "success", "message": f"Top Produk ({time_label}):", "data": table_data, "charts": [{"title": "Top Penjualan", "type": "bar", "data": chart_data}]}
 
         if command_type == 'trend_analysis':
+            # Menggunakan tail(limit) agar user bisa meminta "50 data penjualan"
             daily = df_period.groupby(df_period[c_waktu].dt.date)[c_qty].sum().reset_index()
-            chart_trend = [{"name": str(r[0]), "value": int(r[1])} for r in daily.tail(15).values]
-            return {"type": "multi_visual", "status": "success", "message": f"Tren Penjualan ({time_label}):", "charts": [{"title": "Grafik Tren Harian", "type": "line", "data": chart_trend}]}
+            chart_trend = [{"name": str(r[0]), "value": float(r[1])} for r in daily.tail(limit).values]
+            return {"type": "multi_visual", "status": "success", "message": f"Tren {limit} Data Penjualan Terakhir ({time_label}):", "charts": [{"title": "Grafik Tren", "type": "line", "data": chart_trend}]}
 
         if command_type == 'rekomendasi_restock':
             unique_prods = df_period.groupby([c_nama, c_var, c_sku])[c_qty].sum().reset_index().sort_values(by=c_qty, ascending=False).head(20)
@@ -183,7 +193,7 @@ class RestockPredictor:
                 if forecast:
                     name = f"{row[c_nama]}{', ' + row[c_var] if row[c_var] != '-' else ''}"
                     f_total = sum(d['value'] for d in forecast)
-                    results.append({"sku": str(row[c_sku]), "nama_produk": name, f"prediksi_{forecast_days}_hari": f_total, "urgensi": "NORMAL"})
+                    results.append({"sku": str(row[c_sku]), "nama_produk": name, f"prediksi_{forecast_days}_hari": round(f_total, 2), "urgensi": "NORMAL"})
                     if len(all_charts) < 2:
                         all_charts.append({"title": f"Forecast: {name}", "type": "line", "data": forecast})
             return {"type": "multi_visual", "status": "success", "message": f"Prediksi {forecast_days} Hari:", "data": results, "charts": all_charts}
